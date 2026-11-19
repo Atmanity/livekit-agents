@@ -4,6 +4,7 @@ scripted Atmee API, and the ``AvatarSession`` lifecycle in a faked LiveKit room.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -17,16 +18,27 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 import livekit.plugins.atmee.api as atmee_api
+import livekit.plugins.atmee.avatar as atmee_avatar
 from livekit import api as lk_api, rtc
-from livekit.agents import APIConnectOptions, Plugin
+from livekit.agents import (
+    APIConnectionError,
+    APIConnectOptions,
+    APIError,
+    APIStatusError,
+    Plugin,
+)
 from livekit.agents.voice.avatar import AvatarSession as BaseAvatarSession, DataStreamAudioOutput
+from livekit.agents.voice.io import AgentOutput, AudioOutput, AudioOutputCapabilities
 from livekit.plugins import atmee
 from livekit.plugins.atmee import (
     AtmeeAPI,
+    AtmeeAvatarBusyError,
     AtmeeAvatarNotReadyError,
     AtmeeAvatarWarmingError,
+    AtmeeConnectionError,
     AtmeeException,
     AtmeeNoCapacityError,
+    AtmeeStatusError,
 )
 from livekit.plugins.atmee.avatar import _AvatarAudioOutput
 
@@ -35,7 +47,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.plugin("atmee")]
 AVATAR_ID = "0f0e0d0c-0b0a-4908-8706-050403020100"
 SESSION_ID = "11111111-2222-4333-8444-555555555555"
 LIVEKIT_SECRET = "the-developers-secret-the-developers-secret"
-START = f"/v1/avatars/{AVATAR_ID}/avatar_sessions"
+START = "/v1/avatar_sessions"
 SESSION = f"/v1/avatar_sessions/{SESSION_ID}"
 END = f"{SESSION}/end"
 FAST = APIConnectOptions(max_retry=1, retry_interval=0.0, timeout=5.0)
@@ -86,6 +98,11 @@ class FakeAtmee:
 
 
 @pytest.fixture(autouse=True)
+def _fresh_engine_cache() -> None:
+    atmee_api._ENGINE_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ATMEE_API_KEY", "sk_atmee_test")
     monkeypatch.setenv("LIVEKIT_URL", "wss://dev.livekit.cloud")
@@ -113,11 +130,72 @@ class FakeRoom(rtc.EventEmitter[str]):
         return False
 
 
-class FakeAgentSession(rtc.EventEmitter[str]):
-    def __init__(self) -> None:
-        super().__init__()
+class FakeOutput:
+    """An agent session's output with no wrappers: replacing the tail replaces it all."""
+
+    def __init__(self, audio: Any = None) -> None:
+        self.audio = audio
         self.audio_tails: list[Any] = []
-        self.output = SimpleNamespace(replace_audio_tail=self.audio_tails.append)
+
+    def replace_audio_tail(self, sink: Any) -> None:
+        self.audio_tails.append(sink)
+        self.audio = sink
+
+
+class FakeAgentSession(rtc.EventEmitter[str]):
+    def __init__(self, output: Any = None) -> None:
+        super().__init__()
+        self.output = output if output is not None else FakeOutput()
+        self.audio_tails: list[Any] = getattr(self.output, "audio_tails", [])
+
+
+class Sink(AudioOutput):
+    """A sink that plays nothing and reports nothing, like the room's own audio."""
+
+    def __init__(self, label: str = "room", next_in_chain: AudioOutput | None = None) -> None:
+        super().__init__(
+            label=label,
+            capabilities=AudioOutputCapabilities(pause=True),
+            next_in_chain=next_in_chain,
+        )
+
+    async def capture_frame(self, frame: rtc.AudioFrame) -> None:
+        await super().capture_frame(frame)
+
+    def flush(self) -> None:
+        super().flush()
+
+    def clear_buffer(self) -> None:
+        pass
+
+
+def _frame(rate: int = 16000, seconds: float = 0.1) -> rtc.AudioFrame:
+    samples = int(rate * seconds)
+    return rtc.AudioFrame(bytes(2 * samples), rate, 1, samples)
+
+
+def _frames_go_nowhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avatar outputs send no frames: the base only counts them."""
+
+    async def capture(self: Any, frame: rtc.AudioFrame) -> None:
+        await AudioOutput.capture_frame(self, frame)
+        self._pushed_duration += frame.duration
+
+    monkeypatch.setattr(DataStreamAudioOutput, "capture_frame", capture)
+
+
+def _output(monkeypatch: pytest.MonkeyPatch) -> _AvatarAudioOutput:
+    _frames_go_nowhere(monkeypatch)
+    return _AvatarAudioOutput(
+        room=FakeRoom(),  # type: ignore[arg-type]
+        destination_identity="atmee-avatar-agent",
+        sample_rate=16000,
+        wait_playback_start=True,
+    )
+
+
+def _receipt(**event: Any) -> SimpleNamespace:
+    return SimpleNamespace(caller_identity="atmee-avatar-agent", payload=json.dumps(event))
 
 
 def _avatar(**kwargs: Any) -> atmee.AvatarSession:
@@ -142,10 +220,12 @@ def test_plugin_registered() -> None:
     ("status", "code", "error_type"),
     [
         (503, "no_capacity", AtmeeNoCapacityError),
-        (503, "avatar_version_unavailable", AtmeeException),
-        (502, "avatar_start_failed", AtmeeException),
+        (503, "avatar_version_unavailable", AtmeeStatusError),
+        (502, "avatar_start_failed", AtmeeStatusError),
+        (504, "avatar_join_timeout", AtmeeStatusError),
         (409, "avatar_not_renderable", AtmeeAvatarNotReadyError),
-        (400, "missing_publish_on_behalf", AtmeeException),
+        (409, "avatar_busy", AtmeeAvatarBusyError),
+        (400, "missing_publish_on_behalf", AtmeeStatusError),
     ],
 )
 async def test_start_failures_are_typed_and_never_retried(
@@ -163,6 +243,42 @@ async def test_start_failures_are_typed_and_never_retried(
     )
     assert "why" in str(exc.value) and len(fake.calls("POST", START)) == 1
     assert getattr(exc.value, "retry_after", 5.0) == 5.0
+    # what other LiveKit plugins raise, retryable only where waiting can help
+    assert isinstance(exc.value, APIStatusError) and exc.value.body == error
+    assert exc.value.retryable == (code == "no_capacity")
+
+
+async def test_a_busy_avatar_names_its_live_session(fake: FakeAtmee) -> None:
+    busy = {"error": "avatar_busy", "message": "in use", "liveSessionId": SESSION_ID}
+    fake.script("POST", START, 409, busy)
+    with pytest.raises(AtmeeAvatarBusyError) as exc:
+        await _start(AtmeeAPI(session=fake.session, conn_options=FAST))
+    assert exc.value.live_session_id == SESSION_ID and not exc.value.retryable
+
+
+async def test_a_final_5xx_is_not_retried(fake: FakeAtmee) -> None:
+    fake.script("POST", END, 503, {"error": "embed_disabled"}, times=2)
+    with pytest.raises(AtmeeStatusError) as exc:
+        await AtmeeAPI(session=fake.session, conn_options=FAST).end_avatar_session(SESSION_ID)
+    assert exc.value.code == "embed_disabled" and len(fake.calls("POST", END)) == 1
+
+
+async def test_the_avatars_engine_is_read_once(
+    fake: FakeAtmee, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake.script("GET", f"/v1/avatars/{AVATAR_ID}", 200, {"id": AVATAR_ID, "engine": "v2"})
+    fake.script("POST", START, 202, STARTED, times=2)
+    api = AtmeeAPI(session=fake.session, conn_options=FAST)
+    await _start(api)
+    await _start(api)
+    assert len(fake.calls("GET", f"/v1/avatars/{AVATAR_ID}")) == 1
+    assert len(fake.calls("POST", START)) == 2
+
+    # an engine that could not be read is not remembered, and entries expire
+    monkeypatch.setattr(atmee_api, "_ENGINE_CACHE_TTL", 0.0)
+    fake.script("POST", START, 202, STARTED)
+    await _start(api)
+    assert len(fake.calls("GET", f"/v1/avatars/{AVATAR_ID}")) == 2
 
 
 async def test_a_warming_avatar_is_asked_again_within_the_start_budget(
@@ -245,9 +361,10 @@ async def test_idempotent_calls_are_bounded_by_conn_options(fake: FakeAtmee) -> 
     fake.script("POST", END, 200, {}, delay=1.0)
     api = AtmeeAPI(session=fake.session, conn_options=APIConnectOptions(max_retry=0, timeout=0.1))
     began = asyncio.get_running_loop().time()
-    with pytest.raises(AtmeeException) as exc:
+    with pytest.raises(AtmeeConnectionError) as exc:
         await api.end_avatar_session(SESSION_ID)
     assert exc.value.status_code == 0 and asyncio.get_running_loop().time() - began < 0.9
+    assert isinstance(exc.value, APIConnectionError) and exc.value.retryable
 
 
 @pytest.mark.parametrize(
@@ -273,6 +390,8 @@ def test_client_guards(monkeypatch: pytest.MonkeyPatch) -> None:
         AtmeeAPI(api_url="http://api.example.com")
     AtmeeAPI(api_url="http://127.0.0.1:8080")  # loopback is fine for local development
     assert str(AtmeeException("nope", status_code=402, code="x")) == "nope [x] (HTTP 402)"
+    assert str(AtmeeStatusError("nope", status_code=402, code="x")) == "nope [x] (HTTP 402)"
+    assert isinstance(AtmeeException("nope"), APIError)
     monkeypatch.delenv("ATMEE_API_KEY")
     with pytest.raises(AtmeeException):
         AtmeeAPI()
@@ -294,6 +413,7 @@ async def test_start_mints_token_posts_session_and_routes_audio(fake: FakeAtmee)
     assert call.headers["X-Api-Key"] == "sk_atmee_test" and call.query == {}
     # the request names no avatar generation: the avatar itself decides
     assert call.json == {
+        "avatarId": AVATAR_ID,
         "livekitUrl": "wss://dev.livekit.cloud",
         "agentIdentity": "my-agent",
         "maxDurationSeconds": 3600,
@@ -308,6 +428,9 @@ async def test_start_mints_token_posts_session_and_routes_audio(fake: FakeAtmee)
     assert (
         claims.video is not None and claims.video.room == "dev-room-42" and claims.video.room_join
     )
+    # and nothing more: it publishes and sends receipts, and watches no one
+    assert claims.video.can_publish and claims.video.can_publish_data
+    assert claims.video.can_subscribe is False
     assert jwt.decode(token, options={"verify_signature": False})["kind"] == "agent"
 
     info = avatar.session_info
@@ -329,6 +452,9 @@ async def test_bad_arguments_are_refused_before_anything_happens(fake: FakeAtmee
         await _start(AtmeeAPI(session=fake.session), wait_for="joined")
     with pytest.raises(AtmeeException):
         atmee.AvatarSession(avatar_id="")
+    for ceiling in (0, -60):
+        with pytest.raises(ValueError, match="max_duration_seconds"):
+            _avatar(max_duration_seconds=ceiling)
     closed = _avatar(http_session=fake.session)
     await closed.aclose()  # closed before it started: no billed render is opened
     with pytest.raises(AtmeeException, match="closed"):
@@ -553,3 +679,139 @@ async def test_a_failed_start_cleans_up(fake: FakeAtmee, monkeypatch: pytest.Mon
     monkeypatch.setattr(avatar._api, "aclose", broken_close)
     with pytest.raises(AtmeeNoCapacityError):
         await avatar.start(FakeAgentSession(), FakeRoom())  # type: ignore[arg-type]
+
+
+async def test_start_names_the_room_from_the_job_before_it_connects(
+    fake: FakeAtmee, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a v2 avatar's slow start can overlap the agent connecting to its room
+    class UnconnectedRoom(FakeRoom):
+        name = ""
+
+    fake.script("POST", START, 202, STARTED)
+    avatar = _avatar(http_session=fake.session)
+    with pytest.raises(AtmeeException, match="no name"):  # outside a job: nothing to go by
+        await avatar.start(FakeAgentSession(), UnconnectedRoom())  # type: ignore[arg-type]
+    assert fake.requests == []
+
+    job = SimpleNamespace(
+        local_participant_identity="my-agent", job=SimpleNamespace(room=SimpleNamespace(name="r9"))
+    )
+    monkeypatch.setattr(atmee_avatar, "get_job_context", lambda required=False: job)
+    avatar = _avatar(http_session=fake.session)
+    await avatar.start(FakeAgentSession(), UnconnectedRoom())  # type: ignore[arg-type]
+    token = fake.calls("POST", START)[0].json["livekitToken"]
+    claims = lk_api.TokenVerifier("APIdevkey", LIVEKIT_SECRET).verify(token)
+    assert claims.video is not None and claims.video.room == "r9"
+
+
+async def test_the_resampler_belongs_to_one_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    rates: list[int] = []
+    out = _output(monkeypatch)
+    sent = DataStreamAudioOutput.capture_frame
+
+    async def capture(self: Any, frame: rtc.AudioFrame) -> None:
+        rates.append(frame.sample_rate)
+        await sent(self, frame)
+
+    monkeypatch.setattr(DataStreamAudioOutput, "capture_frame", capture)
+    await out.capture_frame(_frame(24000))
+    out.flush()  # what it still holds is dropped, not carried into the next reply
+    assert out._resampler is None
+    await out.capture_frame(_frame(48000))
+    assert out._resampler is not None and out._resampler_input_rate == 48000
+    await out.capture_frame(_frame(24000))  # a new rate mid-segment gets a resampler of its own
+    assert out._resampler_input_rate == 24000
+    out.clear_buffer()
+    assert out._resampler is None and set(rates) == {16000}
+
+
+async def test_a_lost_avatar_is_never_waited_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = _output(monkeypatch)
+    finished: list[Any] = []
+    out.on("playback_finished", finished.append)
+    # a reply the avatar started playing, flushed, its receipt still to come
+    await out.capture_frame(_frame(seconds=2.0))
+    out._handle_playback_started(_receipt())
+    out.flush()
+    # and the next, still being captured
+    await out.capture_frame(_frame())
+    out.avatar_lost()
+    # the flushed reply ends at once, interrupted where the avatar must have
+    # been: it only just started, far short of the 2 s it was given
+    [first] = finished
+    assert first.interrupted and 0.0 <= first.playback_position < 1.0
+
+    await out.capture_frame(_frame())
+    out.flush()  # the reply it was cut off in ends as interrupted
+    second = await asyncio.wait_for(out.wait_for_playout(), 0.1)
+    assert second.interrupted and second.playback_position == 0.0
+
+    # later replies play nowhere: they count as played, a clear as an interruption
+    started: list[float] = []
+    out.on("playback_started", lambda ev: started.append(ev.created_at))
+    await out.capture_frame(_frame(seconds=0.5))
+    out.flush()
+    third = await asyncio.wait_for(out.wait_for_playout(), 0.1)
+    assert not third.interrupted and third.playback_position == pytest.approx(0.5)
+    await out.capture_frame(_frame())
+    out.clear_buffer()
+    out.flush()
+    assert (await asyncio.wait_for(out.wait_for_playout(), 0.1)).interrupted
+    assert len(started) == 2 and len(finished) == 4
+
+    # a late receipt from the avatar that left changes nothing
+    assert out._handle_playback_finished(_receipt(playback_position=9.0, interrupted=False)) == "ok"
+    assert out._pending_playback_count == 0 and len(finished) == 4
+
+
+async def _lose_the_avatar(fake: FakeAtmee, agent_session: FakeAgentSession) -> Any:
+    fake.script("POST", START, 202, STARTED)
+    fake.script("POST", END, 200, {})
+    room, avatar = FakeRoom(), _avatar(http_session=fake.session)
+    await avatar.start(agent_session, room)  # type: ignore[arg-type]
+    output = avatar._audio_output
+    assert isinstance(output, _AvatarAudioOutput)
+    room.emit("participant_disconnected", SimpleNamespace(identity="atmee-avatar-agent"))
+    await avatar.aclose()
+    return output
+
+
+async def test_the_agent_gets_its_voice_back_when_the_avatar_is_lost(fake: FakeAtmee) -> None:
+    # The avatar took over a running agent's voice, under the agent session's
+    # wrappers: the room's sink is back under them.
+    room_sink = Sink()
+    output = AgentOutput(lambda: None, lambda: None, lambda: None)
+    output.audio = Sink("wrapper", next_in_chain=room_sink)
+    wrapper = output.audio
+    lost = await _lose_the_avatar(fake, FakeAgentSession(output))
+    assert lost._lost and output.audio is wrapper
+    assert atmee_avatar._last_sink(output.audio) is room_sink
+
+    # no wrappers: the avatar replaced the whole output, which comes back whole
+    before = Sink()
+    agent_session = FakeAgentSession(FakeOutput(before))
+    await _lose_the_avatar(fake, agent_session)
+    assert agent_session.output.audio is before
+
+
+async def test_an_avatar_started_first_leaves_the_agent_without_audio(fake: FakeAtmee) -> None:
+    agent_session = FakeAgentSession()
+    lost = await _lose_the_avatar(fake, agent_session)
+    assert lost._lost and agent_session.output.audio is lost  # nothing to give back
+
+
+async def test_close_stops_the_agent_waiting_on_the_avatar(
+    fake: FakeAtmee, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake.script("POST", START, 202, STARTED)
+    fake.script("POST", END, 200, {})
+    avatar = _avatar(http_session=fake.session)
+    await avatar.start(FakeAgentSession(), FakeRoom())  # type: ignore[arg-type]
+    output = avatar._audio_output
+    assert output is not None
+    _frames_go_nowhere(monkeypatch)
+    await output.capture_frame(_frame())
+    output.flush()
+    await avatar.aclose()
+    assert (await asyncio.wait_for(output.wait_for_playout(), 0.1)).interrupted

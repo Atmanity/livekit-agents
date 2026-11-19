@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import timedelta
 from typing import Any, Literal
 
@@ -31,6 +32,7 @@ from livekit.agents import (
     get_job_context,
 )
 from livekit.agents.voice.avatar import AvatarSession as BaseAvatarSession, DataStreamAudioOutput
+from livekit.agents.voice.io import AudioOutput
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
 from .api import (
@@ -57,20 +59,162 @@ _TOKEN_TTL_SLACK = timedelta(minutes=10)
 
 
 class _AvatarAudioOutput(DataStreamAudioOutput):
-    """Sends the avatar 16 kHz audio. A reply already in progress when the
-    avatar takes over the agent's voice keeps the rate it started with."""
+    """The agent's audio, sent to the avatar at 16 kHz.
+
+    A reply already in progress when the avatar takes over the agent's voice
+    keeps the rate it started with, so it is resampled here. The resampler
+    belongs to one segment: a flush or a clear drops it with the few
+    milliseconds it still holds, rather than carrying them into the next
+    reply.
+
+    Once the avatar is lost (:meth:`avatar_lost`) nothing will play or
+    acknowledge audio any more. The segments it was given are finished as
+    interrupted, at an estimate of how far they played, and later segments
+    are taken as played the moment they are flushed, so the agent never
+    waits for a receipt that cannot come.
+    """
 
     _resampler: rtc.AudioResampler | None = None
+    _resampler_input_rate = 0
+    _resampler_channels = 0
+    # a segment is open: captured, not flushed yet
+    _capturing = False
+    # when the avatar said the open segment started playing
+    _segment_started_at: float | None = None
+    _lost = False
+    # of the open segment after the loss: where the avatar was cut off in it
+    # (None for a segment begun after the loss), the audio given to it since,
+    # and whether it was cleared
+    _lost_position: float | None = None
+    _lost_pushed = 0.0
+    _lost_cleared = False
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
+        if self._lost:
+            await self._capture_lost(frame)
+            return
+        if not self._capturing:
+            self._capturing = True
+            self._segment_started_at = None
+        for resampled in self._to_sample_rate(frame):
+            await super().capture_frame(resampled)
+
+    def _to_sample_rate(self, frame: rtc.AudioFrame) -> list[rtc.AudioFrame]:
+        resampler = self._resampler
+        if frame.sample_rate == SAMPLE_RATE and resampler is None:
+            return [frame]
+        frames: list[rtc.AudioFrame] = []
+        if resampler is not None and (
+            frame.sample_rate != self._resampler_input_rate
+            or frame.num_channels != self._resampler_channels
+        ):
+            # the rate changed mid-segment: what the old one holds goes first
+            frames.extend(resampler.flush())
+            resampler = self._resampler = None
         if frame.sample_rate == SAMPLE_RATE:
-            return await super().capture_frame(frame)
-        if self._resampler is None:
-            self._resampler = rtc.AudioResampler(
+            return [*frames, frame]
+        if resampler is None:
+            resampler = self._resampler = rtc.AudioResampler(
                 frame.sample_rate, SAMPLE_RATE, num_channels=frame.num_channels
             )
-        for resampled in self._resampler.push(frame):
-            await super().capture_frame(resampled)
+            self._resampler_input_rate = frame.sample_rate
+            self._resampler_channels = frame.num_channels
+        frames.extend(resampler.push(frame))
+        return frames
+
+    def flush(self) -> None:
+        self._resampler = None
+        if self._lost:
+            self._flush_lost()
+            return
+        self._capturing = False
+        super().flush()
+
+    def clear_buffer(self) -> None:
+        self._resampler = None
+        if self._lost:
+            if self._capturing:
+                self._lost_cleared = True
+            return
+        super().clear_buffer()
+
+    def on_playback_started(self, *, created_at: float) -> None:
+        self._segment_started_at = created_at
+        super().on_playback_started(created_at=created_at)
+
+    def _played_estimate(self) -> float:
+        """How much of the latest segment the avatar played: none before it
+        said it started, then at most what it was given."""
+        if self._segment_started_at is None:
+            return 0.0
+        return max(0.0, min(self._pushed_duration, time.time() - self._segment_started_at))
+
+    def avatar_lost(self) -> None:
+        """The avatar is gone: finish what it was given, and play nothing more."""
+        if self._lost:
+            return
+        self._lost = True
+        self._resampler = None
+        position = self._played_estimate()
+        writer, self._stream_writer = self._stream_writer, None
+        if writer is not None:
+            task = asyncio.create_task(self._close_stream(writer))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        # segments already flushed get no receipt now; the open one is
+        # finished once it is flushed (_flush_lost)
+        flushed = self._pending_playback_count - (1 if self._capturing else 0)
+        if self._capturing:
+            self._lost_position, self._lost_pushed, self._lost_cleared = position, 0.0, False
+        for _ in range(max(flushed, 0)):
+            self.on_playback_finished(playback_position=position, interrupted=True)
+
+    async def _close_stream(self, writer: rtc.ByteStreamWriter) -> None:
+        try:
+            await writer.aclose()
+        except Exception:
+            logger.debug("could not close the audio stream of a lost atmee avatar", exc_info=True)
+
+    async def _capture_lost(self, frame: rtc.AudioFrame) -> None:
+        if not self._capturing:
+            # a segment begun after the loss: nobody plays it, so it counts
+            # as played from the start
+            self._capturing = True
+            self._lost_position, self._lost_pushed, self._lost_cleared = None, 0.0, False
+            await AudioOutput.capture_frame(self, frame)
+            self.on_playback_started(created_at=time.time())
+        else:
+            await AudioOutput.capture_frame(self, frame)
+        self._lost_pushed += frame.duration
+
+    def _flush_lost(self) -> None:
+        AudioOutput.flush(self)
+        writer, self._stream_writer = self._stream_writer, None
+        if writer is not None:
+            # opened by a capture that was under way when the avatar was lost
+            task = asyncio.create_task(self._close_stream(writer))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        if not self._capturing:
+            return
+        self._capturing = False
+        if self._lost_position is not None:
+            # the segment the avatar was cut off in
+            self.on_playback_finished(playback_position=self._lost_position, interrupted=True)
+        else:
+            self.on_playback_finished(
+                playback_position=self._lost_pushed, interrupted=self._lost_cleared
+            )
+
+    def _handle_playback_started(self, data: rtc.RpcInvocationData) -> str:
+        if self._lost:
+            return "ok"  # a late receipt from the avatar that left
+        return super()._handle_playback_started(data)
+
+    def _handle_playback_finished(self, data: rtc.RpcInvocationData) -> str:
+        if self._lost:
+            return "ok"
+        return super()._handle_playback_finished(data)
 
 
 class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
@@ -91,7 +235,13 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
 
     Emits ``avatar_disconnected`` (the ``rtc.RemoteParticipant``) if the
     avatar participant leaves the room while the session is still running,
-    for example because its rendering worker died.
+    for example because its rendering worker died. The agent never waits on
+    the lost avatar: what it was saying ends as interrupted, and if the
+    avatar took over a voice the agent already had (started after
+    ``agent_session.start``), the agent speaks with that voice again.
+    Started before it, the avatar replaced nothing, and the agent goes on
+    without audio: handle the event to end the call or start a new
+    ``AvatarSession``.
     """
 
     def __init__(
@@ -117,7 +267,8 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             avatar_participant_identity: identity the avatar joins with
                 (``atmee-avatar-agent``). Set it when one room hosts several
                 avatars.
-            max_duration_seconds: hard ceiling of the session (default 3600).
+            max_duration_seconds: hard ceiling of the session (default 3600);
+                anything but a positive number raises ``ValueError``.
             metadata: free-form JSON attached to the session on the Atmee side.
             wait_for: ``"initializing"`` (default) returns from :meth:`start`
                 once the worker acknowledged the start; ``"avatar_joined"``
@@ -136,6 +287,11 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         _warn_avatar_version(avatar_version)
         if not avatar_id:
             raise AtmeeException("avatar_id is required")
+        if int(max_duration_seconds) <= 0:
+            raise ValueError(
+                f"max_duration_seconds must be a positive number of seconds, "
+                f"got {max_duration_seconds!r}"
+            )
         super().__init__()
         self._avatar_id = avatar_id
         self._max_duration_seconds = int(max_duration_seconds)
@@ -176,6 +332,13 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         self._room_for_events: rtc.Room | None = None
         self._agent_session_for_events: AgentSession[Any] | None = None
         self._aclose_task: asyncio.Task[None] | None = None
+        # The audio output the agent speaks through to the avatar, and what it
+        # spoke through before (the whole chain and its last sink), so the
+        # agent gets its own voice back if the avatar is lost.
+        self._audio_output: _AvatarAudioOutput | None = None
+        self._audio_agent_session: AgentSession[Any] | None = None
+        self._previous_audio: AudioOutput | None = None
+        self._previous_audio_tail: AudioOutput | None = None
 
     @property
     def avatar_identity(self) -> str:
@@ -204,7 +367,9 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         word; called after it, the agent speaks with its own voice until the
         avatar takes over. A v1 avatar's start is acknowledged within seconds;
         the first v2 session after a quiet period can take a few minutes, and
-        this waits for it.
+        this waits for it. Inside a job it may run before the room is
+        connected (with ``wait_for="initializing"``: the avatar joins only
+        once your agent is in the room), so a slow start overlaps connecting.
 
         One-shot: each call creates a separately billed render, so a second
         ``start()`` on the same instance raises. After a failed start, create
@@ -284,12 +449,32 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             if job_ctx is not None
             else room.local_participant.identity
         )
+        # A room learns its name when it connects; the job knows it before, so
+        # the render (minutes for a v2 avatar's first start) can be asked for
+        # while the agent is still connecting.
+        room_name = room.name or (job_ctx.job.room.name if job_ctx is not None else "")
+        if not room_name:
+            raise AtmeeException(
+                "the room has no name yet: connect it before starting the avatar, or start "
+                "the avatar inside a LiveKit job"
+            )
         livekit_token = (
             api.AccessToken(api_key=livekit_api_key, api_secret=livekit_api_secret)
             .with_kind("agent")
             .with_identity(self._avatar_participant_identity)
             .with_name(self._avatar_participant_name)
-            .with_grants(api.VideoGrants(room_join=True, room=room.name))
+            # What the renderer needs and nothing more: it publishes video and
+            # audio, sends its receipts over data, and subscribes to no one;
+            # the agent's audio reaches it over a data stream.
+            .with_grants(
+                api.VideoGrants(
+                    room_join=True,
+                    room=room_name,
+                    can_publish=True,
+                    can_publish_data=True,
+                    can_subscribe=False,
+                )
+            )
             # allow the avatar to publish audio and video on behalf of your local agent
             .with_attributes({ATTRIBUTE_PUBLISH_ON_BEHALF: local_participant_identity})
             .with_ttl(timedelta(seconds=self._max_duration_seconds) + _TOKEN_TTL_SLACK)
@@ -298,7 +483,7 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
 
         logger.debug(
             "starting atmee avatar session",
-            extra={"avatar_id": self._avatar_id, "lk.pii.room": room.name},
+            extra={"avatar_id": self._avatar_id, "lk.pii.room": room_name},
         )
         if self._closed:
             # closed before the render was requested: never open a billed render
@@ -360,15 +545,38 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         self._room_for_events = room
         room.on("participant_disconnected", self._on_participant_disconnected)
 
-        agent_session.output.replace_audio_tail(
-            _AvatarAudioOutput(
-                room=room,
-                destination_identity=self._avatar_participant_identity,
-                sample_rate=SAMPLE_RATE,
-                wait_remote_track=rtc.TrackKind.KIND_VIDEO,
-                wait_playback_start=True,
-            ),
+        output = _AvatarAudioOutput(
+            room=room,
+            destination_identity=self._avatar_participant_identity,
+            sample_rate=SAMPLE_RATE,
+            wait_remote_track=rtc.TrackKind.KIND_VIDEO,
+            wait_playback_start=True,
         )
+        self._previous_audio = agent_session.output.audio
+        self._previous_audio_tail = _last_sink(self._previous_audio)
+        self._audio_output, self._audio_agent_session = output, agent_session
+        agent_session.output.replace_audio_tail(output)
+
+    def _give_the_agent_its_voice_back(self) -> None:
+        """The avatar is gone: stop waiting on it, and let the agent speak
+        through what it spoke through before the avatar took over, if
+        anything. Started before the agent session, the avatar replaced
+        nothing: the agent then goes on without audio."""
+        output, agent_session = self._audio_output, self._audio_agent_session
+        if output is None or agent_session is None:
+            return
+        output.avatar_lost()
+        audio = agent_session.output.audio
+        if audio is output:
+            # the avatar's output replaced the whole chain
+            if self._previous_audio is not None:
+                agent_session.output.audio = self._previous_audio
+        elif self._previous_audio_tail is not None and _last_sink(audio) is output:
+            agent_session.output.replace_audio_tail(self._previous_audio_tail)
+        else:
+            return
+        self._audio_output = self._audio_agent_session = None
+        logger.info("the agent speaks with its own voice again")
 
     def _on_participant_disconnected(self, participant: rtc.RemoteParticipant) -> None:
         if participant.identity != self._avatar_participant_identity or self._ended:
@@ -380,6 +588,7 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             "atmee avatar participant left the room",
             extra={"session_id": self.session_id, "lk.pii.identity": participant.identity},
         )
+        self._give_the_agent_its_voice_back()
         self.emit("avatar_disconnected", participant)
         self._schedule_end()
 
@@ -468,6 +677,9 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         if self._agent_session_for_events is not None:
             self._agent_session_for_events.off("close", self._on_agent_session_close)
             self._agent_session_for_events = None
+        if self._audio_output is not None:
+            # nothing plays the agent's audio once the avatar is removed
+            self._audio_output.avatar_lost()
         if self._start_request is not None and not self._start_request.done():
             # A start is still waiting on its request, with no session to end
             # yet: once the request returns, the session it opened is ended and
@@ -481,3 +693,10 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             if isinstance(result, Exception):
                 logger.warning("atmee avatar session cleanup step failed", exc_info=result)
         await self._api.aclose()
+
+
+def _last_sink(audio: AudioOutput | None) -> AudioOutput | None:
+    """The sink at the bottom of an audio output chain."""
+    while audio is not None and audio.next_in_chain is not None:
+        audio = audio.next_in_chain
+    return audio
