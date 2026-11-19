@@ -5,8 +5,9 @@ the room as its own participant and speaks the agent's audio with lips in sync. 
 own speech recognition, model and voice.
 
 Any Atmee avatar renders by its id, v1 (a talking head generated from a single portrait) or v2
-(moves as a whole). Create avatars in the [Atmee studio](https://www.atmee.ai/docs/studio/create-an-avatar)
-or with the [Atmee API](https://www.atmee.ai/docs/api/create-avatar); this plugin renders them.
+(moves as a whole). Create avatars in the [Atmee studio](https://www.atmee.ai/docs/studio/create-an-avatar),
+with the [Atmee API](https://www.atmee.ai/docs/api/create-avatar), or with
+`AtmeeAPI.create_avatar()` (see [Create an avatar](#create-an-avatar)).
 
 See the [Atmee integration docs](https://docs.livekit.io/agents/models/avatar/plugins/atmee/) for more information.
 
@@ -47,17 +48,24 @@ opens is ended and `start()` raises `atmee.AtmeeException` with `code="closed"`.
 The avatar's join token grants it only what it needs: it publishes video and audio and sends data,
 and subscribes to no one in your room.
 
-### If the avatar leaves
+### If the avatar's renderer is lost
 
-If the avatar participant leaves while your agent is running (its rendering worker died, for
-example), the session emits `avatar_disconnected` and the render stops billing. The agent never
-waits on the lost avatar: what it was saying ends as interrupted. If the avatar took over a voice
-the agent already had (see below), the agent speaks with that voice again; started before the agent
-session, the avatar replaced nothing, and the agent goes on without audio. Handle the event to end
-the call or start a new `AvatarSession`:
+When the avatar's renderer is lost (the avatar participant leaves the room, its heartbeat stops,
+or it announces that it is retiring), the session starts a new render under the same identity and
+moves the agent's voice to it once it is in the room, emitting `avatar_replaced` with the new
+session's info. A retiring renderer keeps playing until its replacement takes over; a dead one's
+render is ended first. Each replacement is billed as a render of its own, within what is left of
+`max_duration_seconds`, and a renderer that keeps dying is replaced at most 3 times in 10 minutes.
+Pass `replace_lost_avatar=False` to go on without the avatar instead.
+
+Until the replacement is in, and for good if none can be had, the agent never waits on the lost
+avatar: what it was saying ends as interrupted. If the avatar took over a voice the agent already
+had (see below), the agent speaks with that voice again; started before the agent session, the
+avatar replaced nothing, and the agent goes on without audio. `avatar_lost` (with the error, if
+any) says no replacement is coming; handle it to end the call:
 
 ```python
-avatar.on("avatar_disconnected", lambda _participant: session.shutdown())
+avatar.on("avatar_lost", lambda _error: session.shutdown())
 ```
 
 ### Start the agent first
@@ -91,6 +99,7 @@ attach_task = asyncio.create_task(attach_avatar())  # keep a reference
 | `max_duration_seconds` | `3600` | Hard ceiling of the session. |
 | `wait_for` | `"initializing"` | `"avatar_joined"` makes `start()` block until the avatar is in the room. |
 | `metadata` | `None` | Free-form JSON stored with the session on the Atmee side. |
+| `replace_lost_avatar` | `True` | Start a new render when the avatar's renderer is lost. |
 
 Every failure raises `atmee.AtmeeException`, a `livekit.agents.APIError`, with `status_code`,
 `code`, `message` and `retryable`. An error answer from the API is an `atmee.AtmeeStatusError`
@@ -103,3 +112,22 @@ Every failure raises `atmee.AtmeeException`, a `livekit.agents.APIError`, with `
 - `atmee.AtmeeAvatarNotReadyError`: the avatar has nothing to render yet.
 - `atmee.AtmeeAvatarBusyError`: the avatar is in another live session of your account
   (`live_session_id`); end it, or try again once it has ended.
+
+## Create an avatar
+
+`AtmeeAPI.create_avatar()` creates an avatar from a portrait and, for v2, a voice sample. Each is a
+file path, the file's bytes or an `https://` URL:
+
+```python
+api = atmee.AtmeeAPI()
+avatar_id = await api.create_avatar("Val", "val.png")  # v1: ready at once
+
+avatar_id = await api.create_avatar("Val", "val.png", voice="val.mp3", engine="v2")
+await api.wait_until_ready(avatar_id)  # a v2 avatar builds for minutes
+```
+
+A v2 (`"v2"`) or V2 HD (`"v2hd"`) avatar needs a 10 to 60 second voice sample and a plan that
+includes it (`403 v2_access_required` / `v2hd_access_required` otherwise). Its lip sync is best
+when your agent speaks with that voice. `wait_until_ready()` raises `AtmeeAvatarNotReadyError` when
+the build stops where waiting does not help (`code` is the avatar's status: `failed`, `stalled`,
+`draft` or `awaiting_selection`).

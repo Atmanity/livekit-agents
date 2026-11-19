@@ -24,12 +24,15 @@ never reaches a browser.
 from __future__ import annotations
 
 import asyncio
+import io
+import json as jsonlib
 import mimetypes
 import os
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, get_args
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import aiohttp
 
@@ -50,6 +53,9 @@ from .log import logger
 DEFAULT_API_URL = "https://api.atmanity.us"
 
 WaitFor = Literal["initializing", "avatar_joined"]
+
+# The engines an avatar can be created with (see :meth:`AtmeeAPI.create_avatar`).
+AvatarEngine = Literal["v1", "v2", "v2hd"]
 
 # Deprecated: kept for code written against earlier releases.
 AvatarVersion = Literal["v1", "v2"]
@@ -79,6 +85,11 @@ _V2_ENGINES = frozenset({"v2", "v2hd", "v2pro"})
 _ENGINE_CACHE: dict[tuple[str, str], tuple[str | None, float]] = {}
 _ENGINE_CACHE_TTL = 3600.0
 _ENGINE_CACHE_MAX = 1024
+# An avatar's files, as the API takes them: what a create accepts by kind.
+_ASSET_LIMITS = {"image": 10 * 1024 * 1024, "voice": 12 * 1024 * 1024}
+_ASSET_DEFAULT_EXTENSION = {"image": ".jpg", "voice": ".wav"}
+# Statuses a build does not leave by waiting (see AtmeeAPI.wait_until_ready).
+_STUCK_STATUSES = frozenset({"failed", "stalled", "draft", "awaiting_selection"})
 
 
 class AtmeeException(APIError):
@@ -279,6 +290,9 @@ class AvatarInfo:
     @property
     def ready(self) -> bool:
         """Whether it can be rendered: built, and for a v2 avatar, serving a take."""
+        ready_to_chat = self.raw.get("readyToChat")
+        if isinstance(ready_to_chat, bool):
+            return ready_to_chat
         if self.status != "ready":
             return False
         return self.engine not in _V2_ENGINES or bool(self.raw.get("servingCandidateId"))
@@ -469,41 +483,158 @@ class AtmeeAPI:
         name: str,
         image: str | Path | bytes,
         *,
+        voice: str | Path | bytes | None = None,
+        engine: NotGivenOr[AvatarEngine] = NOT_GIVEN,
         description: str | None = None,
         content_type: str | None = None,
+        voice_content_type: str | None = None,
         avatar_version: NotGivenOr[str] = NOT_GIVEN,
     ) -> str:
-        """Deprecated: create avatars in the Atmee studio or with the Atmee API.
+        """Create an avatar from a portrait (and a voice sample) and return its id.
 
-        Creates a v1 avatar from a portrait (a file path, the image bytes or
-        an ``https://`` URL) and returns its id.
+        ``image`` and ``voice`` are each a file path, the file's bytes or an
+        ``https://`` URL; ``content_type`` and ``voice_content_type`` name
+        what bytes hold (JPEG and WAV when not given).
+
+        - ``engine="v1"`` (the default): a talking head from the portrait
+          alone, ready to render at once. A voice is optional.
+        - ``engine="v2"`` or ``"v2hd"`` (Atmee V2 / V2 HD): needs the
+          portrait and a voice sample (10 to 60 s), and a plan that includes
+          it (``403 v2_access_required`` / ``v2hd_access_required``). Lip
+          sync is best when your agent speaks with that voice. It builds in
+          the background, which takes minutes: :meth:`wait_until_ready`
+          before rendering it.
+
+        ``avatar_version`` is the older name of ``engine``.
         """
-        logger.warning(
-            "create_avatar is deprecated, create avatars in the Atmee studio or with the Atmee API"
-        )
-        if isinstance(image, str) and image.startswith(("http://", "https://")):
-            manifest = {"schemaVersion": 1, "name": name, "assets": {"image": {"url": image}}}
-            if description:
-                manifest["description"] = description
+        chosen: str = "v1"
+        if is_given(engine):
+            chosen = engine
+        elif is_given(avatar_version):
+            _warn_avatar_version(avatar_version)
+            chosen = avatar_version
+        if chosen == "v2pro":
+            chosen = "v2hd"  # V2 HD's former name
+        if chosen not in get_args(AvatarEngine):
+            raise ValueError(f"engine must be one of 'v1', 'v2', 'v2hd', got {chosen!r}")
+        if chosen != "v1" and voice is None:
+            raise ValueError(f"a {chosen} avatar needs a voice sample: pass voice=...")
+
+        manifest: dict[str, Any] = {"schemaVersion": 1, "name": name}
+        if description:
+            manifest["description"] = description
+        if chosen != "v1":
+            manifest["engine"] = chosen
+        assets: dict[str, str | Path | bytes] = {"image": image}
+        if voice is not None:
+            assets["voice"] = voice
+
+        if all(_is_url(a) for a in assets.values()):
+            # the API fetches them itself
+            manifest["assets"] = {kind: {"url": str(a)} for kind, a in assets.items()}
             created = await self._request(
                 "POST", "/v1/avatars", json=manifest, retry=False, total_timeout=120.0
             )
-        else:
-            if isinstance(image, bytes):
-                blob = image
-                filename = "portrait" + (mimetypes.guess_extension(content_type or "") or ".jpg")
-            else:
-                blob, filename = await asyncio.to_thread(Path(image).read_bytes), Path(image).name
+        elif list(assets) == ["image"]:
+            # a v1 avatar from a portrait file: the plain image upload
+            blob, filename, ctype = await self._asset("image", image, content_type)
             form = aiohttp.FormData()
             form.add_field("name", name)
             if description:
                 form.add_field("description", description)
-            ctype = content_type or mimetypes.guess_type(filename)[0] or "image/jpeg"
             form.add_field("file", blob, filename=filename, content_type=ctype)
             created = await self._request(
                 "POST", "/v1/avatars", data=form, retry=False, total_timeout=120.0
             )
+        else:
+            # files: an avatar bundle, the manifest beside one image and one sample
+            bundle = io.BytesIO()
+            with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("avatar.json", jsonlib.dumps(manifest))
+                for kind, asset in assets.items():
+                    ctype_hint = content_type if kind == "image" else voice_content_type
+                    blob, filename, _ = await self._asset(kind, asset, ctype_hint)
+                    zf.writestr(f"{kind}/{filename}", blob)
+            form = aiohttp.FormData()
+            form.add_field(
+                "file", bundle.getvalue(), filename="avatar.zip", content_type="application/zip"
+            )
+            created = await self._request(
+                "POST", "/v1/avatars", data=form, retry=False, total_timeout=300.0
+            )
         return str(created.get("avatarId") or created.get("id") or "")
+
+    async def _asset(
+        self, kind: str, asset: str | Path | bytes, content_type: str | None
+    ) -> tuple[bytes, str, str]:
+        """An avatar file's bytes, a file name with the right extension, and
+        its type. A URL is downloaded (without your API key)."""
+        if isinstance(asset, bytes):
+            blob, name = asset, ""
+        elif _is_url(asset):
+            blob, fetched_type = await self._download(str(asset), _ASSET_LIMITS[kind])
+            name = os.path.basename(unquote(urlsplit(str(asset)).path))
+            content_type = content_type or fetched_type
+        else:
+            path = Path(asset)
+            blob, name = await asyncio.to_thread(path.read_bytes), path.name
+        if len(blob) > _ASSET_LIMITS[kind]:
+            raise ValueError(f"the {kind} is larger than {_ASSET_LIMITS[kind] // 2**20} MB")
+        extension = os.path.splitext(name)[1].lower()
+        if not extension:
+            extension = (
+                mimetypes.guess_extension(content_type or "") or _ASSET_DEFAULT_EXTENSION[kind]
+            )
+        ctype = content_type or mimetypes.guess_type("x" + extension)[0]
+        ctype = ctype or ("image/jpeg" if kind == "image" else "audio/wav")
+        return blob, (os.path.splitext(name)[0] or kind) + extension, ctype
+
+    async def _download(self, url: str, limit: int) -> tuple[bytes, str | None]:
+        try:
+            async with self._ensure_session().get(
+                url, timeout=aiohttp.ClientTimeout(total=120.0)
+            ) as response:
+                if not response.ok:
+                    raise AtmeeException(
+                        f"could not download {url}: HTTP {response.status}", code="fetch_failed"
+                    )
+                blob = await response.content.read(limit + 1)
+                ctype = response.headers.get("Content-Type", "").split(";")[0].strip() or None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            raise AtmeeConnectionError(f"could not download {url}: {e}") from e
+        return blob, ctype
+
+    async def wait_until_ready(
+        self, avatar_id: str, *, timeout: float = 1800.0, poll_interval: float = 5.0
+    ) -> AvatarInfo:
+        """Wait until ``avatar_id`` can be rendered, and return it.
+
+        A v1 avatar is ready at once; a v2 avatar builds for minutes. Raises
+        :class:`AtmeeAvatarNotReadyError` (``code`` the avatar's status) when
+        the build stopped where waiting does not help: ``failed``,
+        ``stalled``, ``draft`` (an input is missing) or ``awaiting_selection``
+        (pick a take in the Atmee studio), and :class:`AtmeeConnectionError`
+        once ``timeout`` seconds passed.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            info = await self.get_avatar(avatar_id)
+            if info.ready:
+                return info
+            if info.status in _STUCK_STATUSES:
+                raise AtmeeAvatarNotReadyError(
+                    f"the avatar is {info.status} and will not get ready by waiting",
+                    status_code=409,
+                    code=info.status,
+                    body=info.raw,
+                    retryable=False,
+                )
+            if loop.time() + poll_interval > deadline:
+                raise AtmeeConnectionError(
+                    f"the avatar was still {info.status or 'building'} after {timeout:.0f} s"
+                )
+            await asyncio.sleep(poll_interval)
 
     async def get_avatar(self, avatar_id: str) -> AvatarInfo:
         return await self._get_avatar(avatar_id)
@@ -674,6 +805,10 @@ async def _error_from_response(response: aiohttp.ClientResponse) -> AtmeeExcepti
             message, live_session_id=live if isinstance(live, str) and live else None, body=body
         )
     return AtmeeStatusError(message, status_code=response.status, code=code, body=body)
+
+
+def _is_url(asset: str | Path | bytes) -> bool:
+    return isinstance(asset, str) and asset.startswith(("http://", "https://"))
 
 
 def _generation(engine: str | None) -> str:

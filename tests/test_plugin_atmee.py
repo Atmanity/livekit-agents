@@ -4,7 +4,9 @@ scripted Atmee API, and the ``AvatarSession`` lifecycle in a faked LiveKit room.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import zipfile
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -46,6 +48,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.plugin("atmee")]
 
 AVATAR_ID = "0f0e0d0c-0b0a-4908-8706-050403020100"
 SESSION_ID = "11111111-2222-4333-8444-555555555555"
+SESSION_ID2 = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 LIVEKIT_SECRET = "the-developers-secret-the-developers-secret"
 START = "/v1/avatar_sessions"
 SESSION = f"/v1/avatar_sessions/{SESSION_ID}"
@@ -85,8 +88,14 @@ class FakeAtmee:
             method=request.method, path=request.path, query=dict(request.query), json=None
         )
         call.headers = dict(request.headers)
+        call.form = None
         if request.content_type == "application/json":
             call.json = await request.json()
+        elif request.content_type == "multipart/form-data":
+            form = await request.post()
+            call.form = {
+                k: (v.file.read() if isinstance(v, web.FileField) else v) for k, v in form.items()
+            }
         self.requests.append(call)
         if not (queue := self.answers.get((request.method, request.path))):
             return web.json_response({"error": "unscripted"}, status=404)
@@ -471,6 +480,7 @@ async def test_avatar_version_is_accepted_but_ignored(
     await avatar.start(FakeAgentSession(), FakeRoom())  # type: ignore[arg-type]
     api = AtmeeAPI(session=fake.session, conn_options=FAST)
     await _start(api, avatar_version="v1")
+    await avatar.aclose()
     assert [r.message for r in caplog.records].count(
         "avatar_version is deprecated and ignored, the avatar's own engine decides how it renders"
     ) == 2
@@ -479,18 +489,82 @@ async def test_avatar_version_is_accepted_but_ignored(
 
 
 @pytest.mark.parametrize("image", ["https://cdn.example/v.jpg", b"jpeg"])
-async def test_create_avatar_still_works_but_is_deprecated(
-    fake: FakeAtmee, caplog: pytest.LogCaptureFixture, image: str | bytes
-) -> None:
+async def test_create_a_v1_avatar_from_a_portrait(fake: FakeAtmee, image: str | bytes) -> None:
     fake.script("POST", "/v1/avatars", 201, {"avatarId": AVATAR_ID, "status": "ready"})
     api = AtmeeAPI(session=fake.session, conn_options=FAST)
     assert await api.create_avatar("Val", image) == AVATAR_ID
     call = fake.calls("POST", "/v1/avatars")[0]
     if isinstance(image, str):
-        assert call.json["assets"] == {"image": {"url": image}}
+        assert call.json == {"schemaVersion": 1, "name": "Val", "assets": {"image": {"url": image}}}
     else:
-        assert call.headers["Content-Type"].startswith("multipart/form-data")
-    assert "create_avatar is deprecated" in caplog.text
+        assert call.form == {"name": "Val", "file": b"jpeg"}
+
+
+async def test_create_a_v2_avatar_from_urls(fake: FakeAtmee) -> None:
+    fake.script("POST", "/v1/avatars", 202, {"avatarId": AVATAR_ID, "status": "building"})
+    api = AtmeeAPI(session=fake.session, conn_options=FAST)
+    image, voice = "https://cdn.example/val.png", "https://cdn.example/val.mp3"
+    assert await api.create_avatar("Val", image, voice=voice, engine="v2") == AVATAR_ID
+    assert fake.calls("POST", "/v1/avatars")[0].json == {
+        "schemaVersion": 1,
+        "name": "Val",
+        "engine": "v2",
+        "assets": {"image": {"url": image}, "voice": {"url": voice}},
+    }
+
+
+async def test_create_a_v2_avatar_from_files(fake: FakeAtmee, tmp_path: Any) -> None:
+    # local files, and a URL among them, go as one bundle
+    (tmp_path / "val.png").write_bytes(b"png")
+    fake.script("GET", "/files/sample", 200, body="mp3", headers={"Content-Type": "audio/mpeg"})
+    fake.script("POST", "/v1/avatars", 202, {"avatarId": AVATAR_ID, "status": "building"})
+    api = AtmeeAPI(session=fake.session, conn_options=FAST)
+    voice = f"{api._api_url}/files/sample"
+    created = await api.create_avatar(
+        "Val", tmp_path / "val.png", voice=voice, engine="v2hd", description="d"
+    )
+    assert created == AVATAR_ID
+    assert "X-Api-Key" not in fake.calls("GET", "/files/sample")[0].headers  # not leaked
+    bundle = zipfile.ZipFile(io.BytesIO(fake.calls("POST", "/v1/avatars")[0].form["file"]))
+    assert sorted(bundle.namelist()) == ["avatar.json", "image/val.png", "voice/sample.mp3"]
+    assert json.loads(bundle.read("avatar.json")) == {
+        "schemaVersion": 1,
+        "name": "Val",
+        "description": "d",
+        "engine": "v2hd",
+    }
+    assert bundle.read("voice/sample.mp3") == b"mp3"
+
+
+async def test_create_avatar_refuses_what_cannot_build(
+    fake: FakeAtmee, caplog: pytest.LogCaptureFixture
+) -> None:
+    api = AtmeeAPI(session=fake.session, conn_options=FAST)
+    with pytest.raises(ValueError, match="voice"):
+        await api.create_avatar("Val", b"jpeg", engine="v2")
+    with pytest.raises(ValueError, match="engine"):
+        await api.create_avatar("Val", b"jpeg", engine="v3")  # type: ignore[arg-type]
+    # the older avatar_version still asks for an engine, which it never did
+    with pytest.raises(ValueError, match="voice"):
+        await api.create_avatar("Val", b"jpeg", avatar_version="v2")
+    assert "avatar_version is deprecated" in caplog.text and fake.requests == []
+
+
+async def test_wait_until_ready(fake: FakeAtmee) -> None:
+    path = f"/v1/avatars/{AVATAR_ID}"
+    fake.script("GET", path, 200, {"id": AVATAR_ID, "status": "building", "engine": "v2"})
+    fake.script("GET", path, 200, {"id": AVATAR_ID, "status": "ready", "readyToChat": True})
+    api = AtmeeAPI(session=fake.session, conn_options=FAST)
+    assert (await api.wait_until_ready(AVATAR_ID, poll_interval=0.01)).ready
+
+    fake.script("GET", path, 200, {"id": AVATAR_ID, "status": "awaiting_selection"})
+    with pytest.raises(AtmeeAvatarNotReadyError) as exc:
+        await api.wait_until_ready(AVATAR_ID, poll_interval=0.01)
+    assert exc.value.code == "awaiting_selection"
+
+    fake.script("GET", path, 200, {"id": AVATAR_ID, "status": "building"}, times=3)
+    with pytest.raises(AtmeeConnectionError, match="still building"):
+        await api.wait_until_ready(AVATAR_ID, timeout=0.02, poll_interval=0.01)
 
 
 async def test_a_reply_in_progress_reaches_the_avatar_at_16k(
@@ -635,6 +709,7 @@ async def test_start_forwards_its_options_and_is_one_shot(fake: FakeAtmee) -> No
     with pytest.raises(AtmeeException, match="already called"):
         await avatar.start(FakeAgentSession(), FakeRoom())  # type: ignore[arg-type]
     assert len(fake.calls("POST", START)) == 1  # no second billed render
+    await avatar.aclose()
 
     avatar = _avatar(http_session=fake.session)  # a 202 without a session id is refused
     with pytest.raises(AtmeeException) as exc:
@@ -703,6 +778,7 @@ async def test_start_names_the_room_from_the_job_before_it_connects(
     token = fake.calls("POST", START)[0].json["livekitToken"]
     claims = lk_api.TokenVerifier("APIdevkey", LIVEKIT_SECRET).verify(token)
     assert claims.video is not None and claims.video.room == "r9"
+    await avatar.aclose()
 
 
 async def test_the_resampler_belongs_to_one_segment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -768,7 +844,7 @@ async def test_a_lost_avatar_is_never_waited_on(monkeypatch: pytest.MonkeyPatch)
 async def _lose_the_avatar(fake: FakeAtmee, agent_session: FakeAgentSession) -> Any:
     fake.script("POST", START, 202, STARTED)
     fake.script("POST", END, 200, {})
-    room, avatar = FakeRoom(), _avatar(http_session=fake.session)
+    room, avatar = FakeRoom(), _avatar(http_session=fake.session, replace_lost_avatar=False)
     await avatar.start(agent_session, room)  # type: ignore[arg-type]
     output = avatar._audio_output
     assert isinstance(output, _AvatarAudioOutput)
@@ -815,3 +891,155 @@ async def test_close_stops_the_agent_waiting_on_the_avatar(
     output.flush()
     await avatar.aclose()
     assert (await asyncio.wait_for(output.wait_for_playout(), 0.1)).interrupted
+
+
+# --- replacing a lost renderer -----------------------------------------------------
+
+END2 = f"/v1/avatar_sessions/{SESSION_ID2}/end"
+STARTED2 = {**STARTED, "sessionId": SESSION_ID2, "status": "avatar_joined"}
+
+
+def _renderer(sid: str) -> SimpleNamespace:
+    return SimpleNamespace(identity="atmee-avatar-agent", sid=sid)
+
+
+def _status(event: str, sid: str = "PA_1") -> SimpleNamespace:
+    data = json.dumps({"event": event}).encode()
+    return SimpleNamespace(topic="atmanity-avatar_status", participant=_renderer(sid), data=data)
+
+
+async def _started_avatar(
+    fake: FakeAtmee, **kwargs: Any
+) -> tuple[atmee.AvatarSession, FakeRoom, FakeAgentSession, dict[str, list[Any]]]:
+    fake.script("POST", START, 202, STARTED)
+    room, agent_session = FakeRoom(), FakeAgentSession()
+    avatar = _avatar(http_session=fake.session, **kwargs)
+    events: dict[str, list[Any]] = defaultdict(list)
+    for name in ("avatar_disconnected", "avatar_replaced", "avatar_lost"):
+        avatar.on(name, lambda ev, name=name: events[name].append(ev))
+    await avatar.start(agent_session, room)  # type: ignore[arg-type]
+    room.emit("participant_connected", _renderer("PA_1"))
+    return avatar, room, agent_session, events
+
+
+async def _until(condition: Any) -> None:
+    for _ in range(200):
+        if condition():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition never became true")
+
+
+def _paths(fake: FakeAtmee) -> list[tuple[str, str]]:
+    return [(r.method, r.path) for r in fake.requests if r.method == "POST"]
+
+
+async def test_a_renderer_that_left_is_replaced(fake: FakeAtmee) -> None:
+    avatar, room, agent_session, events = await _started_avatar(fake)
+    first = avatar._audio_output
+    fake.script("POST", END, 200, {})
+    fake.script("POST", START, 202, STARTED2)
+    room.emit("participant_disconnected", _renderer("PA_1"))
+    await _until(lambda: events["avatar_replaced"])
+
+    # the dead render is ended first, then a new one is asked for, in the room
+    # before the agent's voice moves to it, within what is left of the ceiling
+    assert _paths(fake) == [("POST", START), ("POST", END), ("POST", START)]
+    again = fake.calls("POST", START)[1]
+    assert again.query == {"waitFor": "avatar_joined"}
+    assert 3590 <= again.json["maxDurationSeconds"] <= 3600
+    claims = lk_api.TokenVerifier("APIdevkey", LIVEKIT_SECRET).verify(again.json["livekitToken"])
+    assert claims.identity == "atmee-avatar-agent" and claims.video.can_subscribe is False
+    assert (
+        avatar.session_id == SESSION_ID2 and events["avatar_replaced"][0].session_id == SESSION_ID2
+    )
+    assert (
+        first is not None and first._lost and avatar._audio_output is agent_session.audio_tails[-1]
+    )
+    assert len(events["avatar_disconnected"]) == 1 and not events["avatar_lost"]
+
+    # the replacement joins; its predecessor being reported gone again changes nothing
+    room.emit("participant_connected", _renderer("PA_2"))
+    room.emit("participant_disconnected", _renderer("PA_1"))
+    await asyncio.sleep(0.02)
+    assert len(fake.calls("POST", START)) == 2
+
+    fake.script("POST", END2, 200, {})
+    await avatar.aclose()
+    assert len(fake.calls("POST", END2)) == 1
+
+
+async def test_a_renderer_whose_heartbeat_stops_is_replaced(
+    fake: FakeAtmee, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # hard-killed: it stays in the room, silent, for tens of seconds
+    monkeypatch.setattr(atmee_avatar, "_HEARTBEAT_TIMEOUT", 0.05)
+    avatar, room, _, events = await _started_avatar(fake)
+    fake.script("POST", END, 200, {})
+    fake.script("POST", START, 202, STARTED2)
+    await asyncio.sleep(0.1)
+    assert not events["avatar_replaced"]  # never heard from: never taken for dead
+    room.emit("data_received", _status("avatar_worker_heartbeat"))
+    await _until(lambda: events["avatar_replaced"])
+    assert _paths(fake)[1:] == [("POST", END), ("POST", START)]
+    assert not events["avatar_disconnected"]
+    fake.script("POST", END2, 200, {})
+    await avatar.aclose()
+
+
+async def test_a_retiring_renderer_plays_on_until_its_replacement_is_in(
+    fake: FakeAtmee,
+) -> None:
+    avatar, room, _, events = await _started_avatar(fake)
+    first = avatar._audio_output
+    fake.script("POST", START, 202, STARTED2, delay=0.05)
+    fake.script("POST", END, 200, {})
+    room.emit("data_received", _status("avatar_worker_going_away"))
+    await _until(lambda: fake.calls("POST", START)[1:])
+    assert first is not None and not first._lost  # still the agent's voice
+    await _until(lambda: events["avatar_replaced"])
+    # its render ends only once the replacement took over
+    assert _paths(fake)[1:] == [("POST", START), ("POST", END)] and first._lost
+    # the evicted renderer leaving is not a loss
+    room.emit("participant_disconnected", _renderer("PA_1"))
+    await asyncio.sleep(0.02)
+    assert len(fake.calls("POST", START)) == 2 and not events["avatar_lost"]
+    fake.script("POST", END2, 200, {})
+    await avatar.aclose()
+
+
+async def test_without_a_replacement_the_agent_goes_on_without_the_avatar(
+    fake: FakeAtmee, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the replacement fails
+    avatar, room, _, events = await _started_avatar(fake)
+    fake.script("POST", END, 200, {})
+    fake.script("POST", START, 503, {"error": "no_capacity"})
+    room.emit("participant_disconnected", _renderer("PA_1"))
+    await _until(lambda: events["avatar_lost"])
+    assert isinstance(events["avatar_lost"][0], AtmeeNoCapacityError)
+    assert avatar._audio_output is not None and avatar._audio_output._lost
+    await avatar.aclose()
+
+    # replacements are capped, and can be turned off
+    monkeypatch.setattr(atmee_avatar, "_MAX_REPLACEMENTS", 0)
+    for kwargs in ({}, {"replace_lost_avatar": False}):
+        avatar, room, _, events = await _started_avatar(fake, **kwargs)
+        fake.script("POST", END, 200, {})
+        room.emit("participant_disconnected", _renderer("PA_1"))
+        assert events["avatar_lost"] == [None]
+        await avatar.aclose()
+    assert len(fake.calls("POST", START)) == 4  # 3 starts and the failed replacement
+
+
+async def test_close_during_a_replacement_ends_the_late_render(fake: FakeAtmee) -> None:
+    avatar, room, _, events = await _started_avatar(fake)
+    fake.script("POST", END, 200, {})
+    fake.script("POST", START, 202, STARTED2, delay=0.2)
+    fake.script("POST", END2, 200, {})
+    room.emit("participant_disconnected", _renderer("PA_1"))
+    await _until(lambda: fake.calls("POST", START)[1:])
+    await asyncio.wait_for(avatar.aclose(), timeout=0.15)  # never waits for the request
+    await _until(lambda: fake.calls("POST", END2))  # the render it opened is ended
+    await _until(lambda: avatar._api._session is None)
+    assert not events["avatar_replaced"]

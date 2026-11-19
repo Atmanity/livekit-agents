@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
+from collections import deque
 from datetime import timedelta
 from typing import Any, Literal
 
@@ -56,6 +58,19 @@ DEFAULT_MAX_DURATION_SECONDS = 3600
 # The avatar's token outlives the session ceiling by this much so a slow start
 # never joins with an expired token.
 _TOKEN_TTL_SLACK = timedelta(minutes=10)
+# The renderer says it is alive once a second on this topic, addressed to the
+# agent, and that it is retiring (it keeps rendering until a replacement
+# joins under its identity and evicts it).
+_STATUS_TOPIC = "atmanity-avatar_status"
+# Silence from a renderer that has been heard from that means it is gone: a
+# hard-killed renderer stays in the room for tens of seconds otherwise.
+_HEARTBEAT_TIMEOUT = 5.0
+# A renderer that keeps dying is not replaced forever: at most this many
+# replacements within the window, each a render billed on its own.
+_MAX_REPLACEMENTS = 3
+_REPLACEMENT_WINDOW = 600.0
+# No replacement is asked for with less of the session's ceiling left.
+_MIN_REPLACEMENT_SECONDS = 60.0
 
 
 class _AvatarAudioOutput(DataStreamAudioOutput):
@@ -217,7 +232,9 @@ class _AvatarAudioOutput(DataStreamAudioOutput):
         return super()._handle_playback_finished(data)
 
 
-class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
+class AvatarSession(
+    BaseAvatarSession[Literal["avatar_disconnected", "avatar_replaced", "avatar_lost"]]
+):
     """An Atmee avatar session: render an Atmee avatar into your agent's room.
 
     Any Atmee avatar renders by its id: a **v1 avatar** is a talking head
@@ -233,15 +250,25 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
     leaves, the room closes, or :meth:`aclose` runs (which also removes the
     avatar participant); a ceiling of ``max_duration_seconds`` bounds it.
 
-    Emits ``avatar_disconnected`` (the ``rtc.RemoteParticipant``) if the
-    avatar participant leaves the room while the session is still running,
-    for example because its rendering worker died. The agent never waits on
-    the lost avatar: what it was saying ends as interrupted, and if the
-    avatar took over a voice the agent already had (started after
+    A lost renderer is replaced: when the avatar participant leaves, its
+    heartbeat stops, or it says it is retiring, a new render is started under
+    the same identity, and the agent's voice moves to it once it is in the
+    room (``avatar_replaced``, with the new :class:`AvatarSessionInfo`). A
+    retiring renderer keeps playing until its replacement takes over; a dead
+    one's render is ended first. Each replacement is a render billed on its
+    own, within what is left of ``max_duration_seconds``, and a renderer that
+    keeps dying is replaced at most 3 times in 10 minutes.
+
+    Meanwhile, and for good if no replacement can be had
+    (``avatar_lost``, with the error, if any), the agent never waits on the
+    lost avatar: what it was saying ends as interrupted, and if the avatar
+    took over a voice the agent already had (started after
     ``agent_session.start``), the agent speaks with that voice again.
     Started before it, the avatar replaced nothing, and the agent goes on
-    without audio: handle the event to end the call or start a new
-    ``AvatarSession``.
+    without audio: handle ``avatar_lost`` to end the call.
+
+    Also emits ``avatar_disconnected`` (the ``rtc.RemoteParticipant``)
+    whenever the avatar participant leaves the room while the session runs.
     """
 
     def __init__(
@@ -257,6 +284,7 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         wait_for: WaitFor = "initializing",
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         http_session: aiohttp.ClientSession | None = None,
+        replace_lost_avatar: bool = True,
         avatar_version: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
         """
@@ -280,6 +308,8 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             http_session: an aiohttp session to reuse; the job's shared one by
                 default, or a private one outside a job (released by
                 :meth:`aclose`).
+            replace_lost_avatar: start a new render when the avatar's renderer
+                is lost (the default); ``False`` goes on without the avatar.
             avatar_version: deprecated and ignored; the avatar's own engine
                 decides how it renders.
         """
@@ -339,6 +369,26 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         self._audio_agent_session: AgentSession[Any] | None = None
         self._previous_audio: AudioOutput | None = None
         self._previous_audio_tail: AudioOutput | None = None
+        # What a replacement render is asked for with, kept from the start.
+        self._replace_lost_avatar = replace_lost_avatar
+        self._livekit_url = ""
+        self._livekit_api_key = ""
+        self._livekit_api_secret = ""
+        self._room_name = ""
+        self._agent_identity = ""
+        self._render_started_at = 0.0
+        self._replace_task: asyncio.Task[None] | None = None
+        self._replacing_retiring = False
+        self._replacements: deque[float] = deque()
+        # The renderer in the room now, and the ones replaced: a predecessor
+        # its replacement evicted may be reported as leaving after it joined.
+        self._renderer_sid: str | None = None
+        self._outgoing_sid: str | None = None
+        self._replaced_sids: set[str] = set()
+        # When the renderer was last heard from; None until it first is.
+        self._last_beat: float | None = None
+        self._beat_heard = asyncio.Event()
+        self._watch_task: asyncio.Task[None] | None = None
 
     @property
     def avatar_identity(self) -> str:
@@ -458,28 +508,10 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
                 "the room has no name yet: connect it before starting the avatar, or start "
                 "the avatar inside a LiveKit job"
             )
-        livekit_token = (
-            api.AccessToken(api_key=livekit_api_key, api_secret=livekit_api_secret)
-            .with_kind("agent")
-            .with_identity(self._avatar_participant_identity)
-            .with_name(self._avatar_participant_name)
-            # What the renderer needs and nothing more: it publishes video and
-            # audio, sends its receipts over data, and subscribes to no one;
-            # the agent's audio reaches it over a data stream.
-            .with_grants(
-                api.VideoGrants(
-                    room_join=True,
-                    room=room_name,
-                    can_publish=True,
-                    can_publish_data=True,
-                    can_subscribe=False,
-                )
-            )
-            # allow the avatar to publish audio and video on behalf of your local agent
-            .with_attributes({ATTRIBUTE_PUBLISH_ON_BEHALF: local_participant_identity})
-            .with_ttl(timedelta(seconds=self._max_duration_seconds) + _TOKEN_TTL_SLACK)
-            .to_jwt()
-        )
+        self._livekit_url, self._livekit_api_key = livekit_url, livekit_api_key
+        self._livekit_api_secret, self._room_name = livekit_api_secret, room_name
+        self._agent_identity = local_participant_identity
+        livekit_token = self._token(self._max_duration_seconds)
 
         logger.debug(
             "starting atmee avatar session",
@@ -542,9 +574,45 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             },
         )
 
-        self._room_for_events = room
-        room.on("participant_disconnected", self._on_participant_disconnected)
+        self._render_started_at = asyncio.get_running_loop().time()
 
+        self._room_for_events = room
+        room.on("participant_connected", self._on_participant_connected)
+        room.on("participant_disconnected", self._on_participant_disconnected)
+        room.on("data_received", self._on_data_received)
+        self._renderer_sid = self._sid_in(room)  # with wait_for="avatar_joined", it is in
+        self._watch_task = asyncio.create_task(self._watch_heartbeat())
+
+        self._previous_audio = agent_session.output.audio
+        self._previous_audio_tail = _last_sink(self._previous_audio)
+        self._route_audio_to_avatar(agent_session, room)
+
+    def _token(self, ttl_seconds: float) -> str:
+        """The avatar participant's join token, minted with your LiveKit secret."""
+        return (
+            api.AccessToken(api_key=self._livekit_api_key, api_secret=self._livekit_api_secret)
+            .with_kind("agent")
+            .with_identity(self._avatar_participant_identity)
+            .with_name(self._avatar_participant_name)
+            # What the renderer needs and nothing more: it publishes video and
+            # audio, sends its receipts over data, and subscribes to no one;
+            # the agent's audio reaches it over a data stream.
+            .with_grants(
+                api.VideoGrants(
+                    room_join=True,
+                    room=self._room_name,
+                    can_publish=True,
+                    can_publish_data=True,
+                    can_subscribe=False,
+                )
+            )
+            # allow the avatar to publish audio and video on behalf of your local agent
+            .with_attributes({ATTRIBUTE_PUBLISH_ON_BEHALF: self._agent_identity})
+            .with_ttl(timedelta(seconds=ttl_seconds) + _TOKEN_TTL_SLACK)
+            .to_jwt()
+        )
+
+    def _route_audio_to_avatar(self, agent_session: AgentSession[Any], room: rtc.Room) -> None:
         output = _AvatarAudioOutput(
             room=room,
             destination_identity=self._avatar_participant_identity,
@@ -552,8 +620,9 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             wait_remote_track=rtc.TrackKind.KIND_VIDEO,
             wait_playback_start=True,
         )
-        self._previous_audio = agent_session.output.audio
-        self._previous_audio_tail = _last_sink(self._previous_audio)
+        if self._audio_output is not None:
+            # the renderer it spoke to is gone; nothing will answer for it
+            self._audio_output.avatar_lost()
         self._audio_output, self._audio_agent_session = output, agent_session
         agent_session.output.replace_audio_tail(output)
 
@@ -567,10 +636,9 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
             return
         output.avatar_lost()
         audio = agent_session.output.audio
-        if audio is output:
+        if audio is output and self._previous_audio is not None:
             # the avatar's output replaced the whole chain
-            if self._previous_audio is not None:
-                agent_session.output.audio = self._previous_audio
+            agent_session.output.audio = self._previous_audio
         elif self._previous_audio_tail is not None and _last_sink(audio) is output:
             agent_session.output.replace_audio_tail(self._previous_audio_tail)
         else:
@@ -578,19 +646,195 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         self._audio_output = self._audio_agent_session = None
         logger.info("the agent speaks with its own voice again")
 
+    def _sid_in(self, room: rtc.Room) -> str | None:
+        """The sid of the avatar participant in ``room``, if it is there."""
+        participants = getattr(room, "remote_participants", None) or {}
+        participant = participants.get(self._avatar_participant_identity)
+        return getattr(participant, "sid", None) or None
+
+    def _on_participant_connected(self, participant: rtc.RemoteParticipant) -> None:
+        if participant.identity == self._avatar_participant_identity:
+            self._renderer_sid = getattr(participant, "sid", None) or None
+
     def _on_participant_disconnected(self, participant: rtc.RemoteParticipant) -> None:
-        if participant.identity != self._avatar_participant_identity or self._ended:
+        if participant.identity != self._avatar_participant_identity or self._closed:
             return
-        # The avatar left while we are still running: its worker died or was
-        # removed. The worker reports its own end to Atmee; ending here too
-        # closes the gap for a worker that could not (idempotent).
+        sid = getattr(participant, "sid", None)
+        if sid and (
+            sid in self._replaced_sids or (self._renderer_sid and sid != self._renderer_sid)
+        ):
+            return  # a predecessor its replacement evicted
         logger.warning(
             "atmee avatar participant left the room",
             extra={"session_id": self.session_id, "lk.pii.identity": participant.identity},
         )
-        self._give_the_agent_its_voice_back()
         self.emit("avatar_disconnected", participant)
-        self._schedule_end()
+        self._renderer_lost("left the room")
+
+    def _on_data_received(self, packet: rtc.DataPacket) -> None:
+        sender = packet.participant
+        if (
+            packet.topic != _STATUS_TOPIC
+            or sender is None
+            or sender.identity != self._avatar_participant_identity
+        ):
+            return
+        try:
+            event = json.loads(packet.data).get("event")
+        except (TypeError, ValueError, AttributeError):
+            return
+        if event == "avatar_worker_heartbeat":
+            self._last_beat = asyncio.get_running_loop().time()
+            self._beat_heard.set()
+        elif event == "avatar_worker_going_away":
+            self._renderer_lost(
+                "going away", retiring=True, sid=getattr(sender, "sid", None) or None
+            )
+
+    async def _watch_heartbeat(self) -> None:
+        """Take a renderer that stopped beating for gone. Armed only once it
+        was heard from, so a renderer that sends no heartbeat is never taken
+        for dead."""
+        loop = asyncio.get_running_loop()
+        while not self._closed:
+            last = self._last_beat
+            if last is None:
+                self._beat_heard.clear()
+                await self._beat_heard.wait()
+                continue
+            silent_for = loop.time() - last
+            if silent_for < _HEARTBEAT_TIMEOUT:
+                await asyncio.sleep(_HEARTBEAT_TIMEOUT - silent_for)
+                continue
+            self._last_beat = None  # armed again by the next renderer's first beat
+            self._renderer_lost("stopped its heartbeat")
+
+    def _renderer_lost(self, why: str, *, retiring: bool = False, sid: str | None = None) -> None:
+        """The renderer is gone, or retiring: replace it, or go on without it."""
+        if self._closed:
+            return
+        if not retiring:
+            # its beats are over: the next renderer's first beat arms the watch
+            self._last_beat = None
+        replacing = self._replace_task is not None and not self._replace_task.done()
+        if replacing:
+            if not retiring and self._replacing_retiring:
+                # the retiring renderer is gone before its replacement came
+                self._give_the_agent_its_voice_back()
+            return
+        if not retiring:
+            # nothing plays the agent's audio until a replacement is in
+            self._give_the_agent_its_voice_back()
+        if not self._may_replace():
+            if not retiring:  # a retiring renderer plays on; its leaving comes later
+                logger.warning(
+                    "atmee avatar renderer lost; continuing without the avatar",
+                    extra={"session_id": self.session_id, "reason": why},
+                )
+                self._schedule_end()
+                self.emit("avatar_lost", None)
+            return
+        logger.warning(
+            "atmee avatar renderer lost; starting a replacement",
+            extra={"session_id": self.session_id, "reason": why},
+        )
+        self._replacing_retiring = retiring
+        self._outgoing_sid = sid or self._renderer_sid
+        agent_session, room = self._agent_session_for_events, self._room_for_events
+        assert agent_session is not None and room is not None  # _may_replace checked
+        self._replace_task = asyncio.create_task(
+            self._replace(agent_session, room, retiring=retiring)
+        )
+
+    def _ceiling_left(self) -> float:
+        elapsed = asyncio.get_running_loop().time() - self._render_started_at
+        return self._max_duration_seconds - elapsed
+
+    def _may_replace(self) -> bool:
+        if not self._replace_lost_avatar:
+            return False
+        if self._agent_session_for_events is None or self._room_for_events is None:
+            return False
+        if self._ceiling_left() < _MIN_REPLACEMENT_SECONDS:
+            return False
+        now = asyncio.get_running_loop().time()
+        while self._replacements and now - self._replacements[0] > _REPLACEMENT_WINDOW:
+            self._replacements.popleft()
+        return len(self._replacements) < _MAX_REPLACEMENTS
+
+    async def _replace(
+        self, agent_session: AgentSession[Any], room: rtc.Room, *, retiring: bool
+    ) -> None:
+        """Start a new render under the avatar's identity and move the
+        agent's voice to it once it is in the room."""
+        if self._closed:
+            return
+        previous_session_id = self.session_id
+        if not retiring:
+            # the dead render: stop billing it, and free the slot it holds
+            await self._end_session()
+        previous_ended = self._ended
+        if self._closed:
+            return
+        ceiling = int(self._ceiling_left())
+        self._replacements.append(asyncio.get_running_loop().time())
+        request = asyncio.ensure_future(
+            self._api.create_avatar_session(
+                self._avatar_id,
+                livekit_url=self._livekit_url,
+                livekit_token=self._token(ceiling),
+                agent_identity=self._agent_identity,
+                max_duration_seconds=ceiling,
+                metadata=self._metadata,
+                # its voice moves over only once it is in the room
+                wait_for="avatar_joined",
+                stop=self._stop_start,
+            )
+        )
+        self._start_request = request
+        # never cancelled: the render it may open could not be ended otherwise
+        await asyncio.wait({request})
+        if self._closed:
+            await self._settle_closed_start(request)
+            return
+        try:
+            info = request.result()
+        except Exception as e:
+            logger.warning(
+                "could not replace the lost atmee avatar; continuing without it",
+                extra={"error": str(e)},
+            )
+            if not retiring:
+                self.emit("avatar_lost", e)
+            # a retiring renderer plays on, and its leaving asks again
+            return
+        self.session_info, self.session_id, self._ended = info, info.session_id, False
+        if self._outgoing_sid:
+            self._replaced_sids.add(self._outgoing_sid)
+        joined = self._sid_in(room)
+        if joined and joined not in self._replaced_sids:
+            self._renderer_sid = joined
+        elif self._renderer_sid in self._replaced_sids:
+            self._renderer_sid = None  # learnt when its join is reported
+        self._route_audio_to_avatar(agent_session, room)
+        if previous_session_id and not previous_ended:
+            # a retiring render (or a dead one whose end failed) is over now
+            await self._end_session_quietly(previous_session_id)
+        logger.info(
+            "atmee avatar replaced",
+            extra={"session_id": info.session_id, "previous_session_id": previous_session_id},
+        )
+        self.emit("avatar_replaced", info)
+
+    async def _end_session_quietly(self, session_id: str) -> None:
+        try:
+            await self._api.end_avatar_session(session_id)
+        except Exception as e:
+            logger.warning(
+                "failed to end a replaced atmee avatar session; the worker's own report or "
+                "the session ceiling will settle it",
+                extra={"session_id": session_id, "error": str(e)},
+            )
 
     def _on_agent_session_close(self, _: Any) -> None:
         if self._aclose_task is None:
@@ -608,7 +852,7 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
         if not request.cancelled() and request.exception() is None:
             info = request.result()  # failed or stopped requests opened nothing
         if info is not None:
-            self.session_id = info.session_id
+            self.session_id, self._ended = info.session_id, False
         async with self._close_lock:
             await self._aclose_locked()
         return info is not None
@@ -672,8 +916,13 @@ class AvatarSession(BaseAvatarSession[Literal["avatar_disconnected"]]):
 
     async def _aclose_locked(self) -> None:
         if self._room_for_events is not None:
+            self._room_for_events.off("participant_connected", self._on_participant_connected)
             self._room_for_events.off("participant_disconnected", self._on_participant_disconnected)
+            self._room_for_events.off("data_received", self._on_data_received)
             self._room_for_events = None
+        if self._watch_task is not None:
+            self._watch_task.cancel()
+            self._watch_task = None
         if self._agent_session_for_events is not None:
             self._agent_session_for_events.off("close", self._on_agent_session_close)
             self._agent_session_for_events = None
