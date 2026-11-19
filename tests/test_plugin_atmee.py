@@ -841,10 +841,16 @@ async def test_a_lost_avatar_is_never_waited_on(monkeypatch: pytest.MonkeyPatch)
     assert out._pending_playback_count == 0 and len(finished) == 4
 
 
+@pytest.fixture
+def no_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lost renderer gets no replacement: as when its replacements ran out."""
+    monkeypatch.setattr(atmee_avatar, "_MAX_REPLACEMENTS", 0)
+
+
 async def _lose_the_avatar(fake: FakeAtmee, agent_session: FakeAgentSession) -> Any:
     fake.script("POST", START, 202, STARTED)
     fake.script("POST", END, 200, {})
-    room, avatar = FakeRoom(), _avatar(http_session=fake.session, replace_lost_avatar=False)
+    room, avatar = FakeRoom(), _avatar(http_session=fake.session)
     await avatar.start(agent_session, room)  # type: ignore[arg-type]
     output = avatar._audio_output
     assert isinstance(output, _AvatarAudioOutput)
@@ -853,6 +859,7 @@ async def _lose_the_avatar(fake: FakeAtmee, agent_session: FakeAgentSession) -> 
     return output
 
 
+@pytest.mark.usefixtures("no_replacement")
 async def test_the_agent_gets_its_voice_back_when_the_avatar_is_lost(fake: FakeAtmee) -> None:
     # The avatar took over a running agent's voice, under the agent session's
     # wrappers: the room's sink is back under them.
@@ -871,6 +878,7 @@ async def test_the_agent_gets_its_voice_back_when_the_avatar_is_lost(fake: FakeA
     assert agent_session.output.audio is before
 
 
+@pytest.mark.usefixtures("no_replacement")
 async def test_an_avatar_started_first_leaves_the_agent_without_audio(fake: FakeAtmee) -> None:
     agent_session = FakeAgentSession()
     lost = await _lose_the_avatar(fake, agent_session)
@@ -909,11 +917,11 @@ def _status(event: str, sid: str = "PA_1") -> SimpleNamespace:
 
 
 async def _started_avatar(
-    fake: FakeAtmee, **kwargs: Any
+    fake: FakeAtmee,
 ) -> tuple[atmee.AvatarSession, FakeRoom, FakeAgentSession, dict[str, list[Any]]]:
     fake.script("POST", START, 202, STARTED)
     room, agent_session = FakeRoom(), FakeAgentSession()
-    avatar = _avatar(http_session=fake.session, **kwargs)
+    avatar = _avatar(http_session=fake.session)
     events: dict[str, list[Any]] = defaultdict(list)
     for name in ("avatar_disconnected", "avatar_replaced", "avatar_lost"):
         avatar.on(name, lambda ev, name=name: events[name].append(ev))
@@ -1021,15 +1029,14 @@ async def test_without_a_replacement_the_agent_goes_on_without_the_avatar(
     assert avatar._audio_output is not None and avatar._audio_output._lost
     await avatar.aclose()
 
-    # replacements are capped, and can be turned off
+    # replacements are capped
     monkeypatch.setattr(atmee_avatar, "_MAX_REPLACEMENTS", 0)
-    for kwargs in ({}, {"replace_lost_avatar": False}):
-        avatar, room, _, events = await _started_avatar(fake, **kwargs)
-        fake.script("POST", END, 200, {})
-        room.emit("participant_disconnected", _renderer("PA_1"))
-        assert events["avatar_lost"] == [None]
-        await avatar.aclose()
-    assert len(fake.calls("POST", START)) == 4  # 3 starts and the failed replacement
+    avatar, room, _, events = await _started_avatar(fake)
+    fake.script("POST", END, 200, {})
+    room.emit("participant_disconnected", _renderer("PA_1"))
+    assert events["avatar_lost"] == [None]
+    await avatar.aclose()
+    assert len(fake.calls("POST", START)) == 3  # 2 starts and the failed replacement
 
 
 async def test_close_during_a_replacement_ends_the_late_render(fake: FakeAtmee) -> None:

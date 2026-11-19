@@ -259,8 +259,9 @@ class AvatarSession(
     own, within what is left of ``max_duration_seconds``, and a renderer that
     keeps dying is replaced at most 3 times in 10 minutes.
 
-    Meanwhile, and for good if no replacement can be had
-    (``avatar_lost``, with the error, if any), the agent never waits on the
+    Meanwhile, and for good if no replacement can be had (the start
+    failed, or the limits above were reached: ``avatar_lost``, with the
+    error, if any), the agent never waits on the
     lost avatar: what it was saying ends as interrupted, and if the avatar
     took over a voice the agent already had (started after
     ``agent_session.start``), the agent speaks with that voice again.
@@ -284,7 +285,6 @@ class AvatarSession(
         wait_for: WaitFor = "initializing",
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         http_session: aiohttp.ClientSession | None = None,
-        replace_lost_avatar: bool = True,
         avatar_version: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
         """
@@ -308,8 +308,6 @@ class AvatarSession(
             http_session: an aiohttp session to reuse; the job's shared one by
                 default, or a private one outside a job (released by
                 :meth:`aclose`).
-            replace_lost_avatar: start a new render when the avatar's renderer
-                is lost (the default); ``False`` goes on without the avatar.
             avatar_version: deprecated and ignored; the avatar's own engine
                 decides how it renders.
         """
@@ -370,7 +368,6 @@ class AvatarSession(
         self._previous_audio: AudioOutput | None = None
         self._previous_audio_tail: AudioOutput | None = None
         # What a replacement render is asked for with, kept from the start.
-        self._replace_lost_avatar = replace_lost_avatar
         self._livekit_url = ""
         self._livekit_api_key = ""
         self._livekit_api_secret = ""
@@ -751,8 +748,6 @@ class AvatarSession(
         return self._max_duration_seconds - elapsed
 
     def _may_replace(self) -> bool:
-        if not self._replace_lost_avatar:
-            return False
         if self._agent_session_for_events is None or self._room_for_events is None:
             return False
         if self._ceiling_left() < _MIN_REPLACEMENT_SECONDS:

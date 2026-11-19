@@ -56,7 +56,6 @@ moves the agent's voice to it once it is in the room, emitting `avatar_replaced`
 session's info. A retiring renderer keeps playing until its replacement takes over; a dead one's
 render is ended first. Each replacement is billed as a render of its own, within what is left of
 `max_duration_seconds`, and a renderer that keeps dying is replaced at most 3 times in 10 minutes.
-Pass `replace_lost_avatar=False` to go on without the avatar instead.
 
 Until the replacement is in, and for good if none can be had, the agent never waits on the lost
 avatar: what it was saying ends as interrupted. If the avatar took over a voice the agent already
@@ -99,7 +98,6 @@ attach_task = asyncio.create_task(attach_avatar())  # keep a reference
 | `max_duration_seconds` | `3600` | Hard ceiling of the session. |
 | `wait_for` | `"initializing"` | `"avatar_joined"` makes `start()` block until the avatar is in the room. |
 | `metadata` | `None` | Free-form JSON stored with the session on the Atmee side. |
-| `replace_lost_avatar` | `True` | Start a new render when the avatar's renderer is lost. |
 
 Every failure raises `atmee.AtmeeException`, a `livekit.agents.APIError`, with `status_code`,
 `code`, `message` and `retryable`. An error answer from the API is an `atmee.AtmeeStatusError`
